@@ -75,7 +75,7 @@ runs:
         ARCH="${{ steps.platform.outputs.arch }}"
         EXT="${{ steps.platform.outputs.ext }}"
 
-        gh release download "0.14.2" \
+        gh release download "0.14.3" \
           --repo codested/chagg \
           --pattern "chagg-${OS}-${ARCH}${EXT}" \
           --output chagg
