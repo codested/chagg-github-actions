@@ -1,0 +1,195 @@
+name: 'Verify and preview changes'
+description: >
+  Validates change entries, posts a changelog preview comment on PRs, and
+  notifies Slack when new changes land on the default branch.
+
+inputs:
+  github_token:
+    description: 'GitHub token used to post and update PR comments'
+    required: false
+    default: ${{ github.token }}
+  pr_comment:
+    description: 'Post or update a PR comment with the changelog preview'
+    required: false
+    default: 'true'
+  api_key:
+    description: >
+      chagg project API key (chagg_sk_…). When set, staging changes are
+      uploaded to the chagg service on every default-branch push.
+    required: false
+  api_url:
+    description: 'chagg service base URL'
+    required: false
+    default: 'https://api.chagg.dev'
+runs:
+  using: "composite"
+  steps:
+    # ── install ──────────────────────────────────────────────────────────────
+
+    - name: Detect platform
+      id: platform
+      shell: bash
+      run: |
+        OS=$(echo "$RUNNER_OS" | tr '[:upper:]' '[:lower:]')
+
+        case "$RUNNER_ARCH" in
+          X64)   ARCH=amd64 ;;
+          ARM64) ARCH=arm64 ;;
+          *) echo "Unsupported architecture: $RUNNER_ARCH"; exit 1 ;;
+        esac
+
+        EXT=""
+        [ "$OS" = "windows" ] && EXT=".exe"
+
+        echo "os=$OS"     >> "$GITHUB_OUTPUT"
+        echo "arch=$ARCH" >> "$GITHUB_OUTPUT"
+        echo "ext=$EXT"   >> "$GITHUB_OUTPUT"
+
+    - name: Install chagg
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+      run: |
+        OS="${{ steps.platform.outputs.os }}"
+        ARCH="${{ steps.platform.outputs.arch }}"
+        EXT="${{ steps.platform.outputs.ext }}"
+
+        gh release download "0.14.2" \
+          --repo codested/chagg \
+          --pattern "chagg-${OS}-${ARCH}${EXT}" \
+          --output chagg
+        chmod +x chagg
+        echo "$PWD" >> "$GITHUB_PATH"
+
+    # ── validate ─────────────────────────────────────────────────────────────
+
+    # On a PR: validate only the new change files added by this branch so that
+    # pre-existing issues in older entries don't block unrelated work.
+    # On the default branch (push): validate everything.
+    - name: Validate new change entries (PR)
+      if: github.event_name == 'pull_request'
+      shell: bash
+      run: |
+        NEW_FILES=$(git diff --name-only --diff-filter=A \
+          "origin/${{ github.base_ref }}...HEAD" -- '.changes/')
+
+        if [ -n "$NEW_FILES" ]; then
+          # shellcheck disable=SC2086
+          chagg check $NEW_FILES
+        else
+          echo "No new .changes files in this PR — skipping per-file check."
+        fi
+
+    - name: Validate all change entries (push)
+      if: github.event_name != 'pull_request'
+      shell: bash
+      run: chagg check
+
+    # ── PR preview comment ───────────────────────────────────────────────────
+
+    # Discover all .changes directories in the repo. For a single-module
+    # repo this returns one entry; for monorepos it returns all modules.
+    - name: Detect new change entries
+      id: diff
+      if: github.event_name == 'pull_request' && inputs.pr_comment == 'true'
+      shell: bash
+      run: |
+        chagg config modules --format json > modules.json
+
+        has_new=false
+        while IFS= read -r dir; do
+          new_files=$(git diff --name-only --diff-filter=A \
+            "origin/${{ github.base_ref }}...HEAD" -- "$dir")
+          [ -n "$new_files" ] && has_new=true && break
+        done < <(jq -r '.modules[].changes_dir' modules.json)
+
+        echo "has_new=$has_new" >> "$GITHUB_OUTPUT"
+
+    # Generate the full staging preview when this PR contains new entries.
+    # For multi-module repos this shows staging across all modules.
+    - name: Generate staging preview
+      if: >-
+        github.event_name == 'pull_request' &&
+        inputs.pr_comment == 'true' &&
+        steps.diff.outputs.has_new == 'true'
+      shell: bash
+      run: |
+        # Strip the top-level "# Changelog" header so the version/type
+        # headings (## / ###) sit at a sensible level inside the PR comment.
+        chagg generate --only-staging | tail -n +3 > comment-body.md
+
+    # No new entries found: write a standard warning block instead.
+    - name: Write no-changes warning
+      if: >-
+        github.event_name == 'pull_request' &&
+        inputs.pr_comment == 'true' &&
+        steps.diff.outputs.has_new != 'true'
+      shell: bash
+      run: |
+        printf '%s\n' \
+          '> [!WARNING]' \
+          '> **No change entries detected.**' \
+          '> This PR does not add any files to a `.changes/` directory.' \
+          '> If it includes user-facing changes, please run `chagg add <name> --type <type>`.' \
+          > comment-body.md
+
+    # Create or update the bot comment. A hidden marker keeps idempotent
+    # updates working across pushes to the same PR.
+    - name: Post or update PR comment
+      if: github.event_name == 'pull_request' && inputs.pr_comment == 'true'
+      uses: actions/github-script@v8
+      with:
+        github-token: ${{ inputs.github_token }}
+        script: |
+          const fs = require('fs');
+          const preview = fs.readFileSync('comment-body.md', 'utf8').trim();
+
+          const marker = '<!-- chagg-pr-preview -->';
+          const body   = `${marker}\n> 📋 **Changelog preview** — _generated by [chagg](https://github.com/codested/chagg)_\n\n${preview}`;
+
+          const { data: comments } = await github.rest.issues.listComments({
+            owner: context.repo.owner,
+            repo:  context.repo.repo,
+            issue_number: context.issue.number,
+          });
+
+          const existing = comments.find(c => c.body?.includes(marker));
+
+          if (existing) {
+            await github.rest.issues.updateComment({
+              owner:      context.repo.owner,
+              repo:       context.repo.repo,
+              comment_id: existing.id,
+              body,
+            });
+          } else {
+            await github.rest.issues.createComment({
+              owner:        context.repo.owner,
+              repo:         context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+          }
+
+    # ── Upload staging changes to chagg service ──────────────────────────────
+
+    - name: Upload staging changes
+      if: github.event_name == 'push' && inputs.api_key != ''
+      shell: bash
+      run: |
+        chagg generate --only-staging --format json > staging.json 2>/dev/null
+
+        curl -fsSL -X POST \
+          -H 'Content-Type: application/json' \
+          -H "Authorization: Bearer ${{ inputs.api_key }}" \
+          --data @staging.json \
+          "${{ inputs.api_url }}/changelogs"
+
+    - name: Upload resources
+      if: github.event_name == 'push' && inputs.api_key != ''
+      shell: bash
+      run: |
+        "${{ github.action_path }}/../scripts/upload-resources.sh" \
+          staging.json \
+          "${{ inputs.api_key }}" \
+          "${{ inputs.api_url }}"

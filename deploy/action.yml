@@ -1,0 +1,51 @@
+name: 'Mark release as deployed'
+description: >
+  Marks a release as deployed in the chagg service.
+  Uses the same project API key as the changelog upload.
+
+inputs:
+  api_key:
+    description: 'chagg project API key (chagg_sk_...)'
+    required: true
+  version:
+    description: 'Release version to mark as deployed (e.g. "1.2.3", without "v" prefix)'
+    required: true
+  via:
+    description: 'How the deployment was triggered (e.g. "github-action", "fly-io", "vercel")'
+    required: false
+    default: 'github-action'
+  auto_grant:
+    description: 'If true, automatically grants deployment before marking as deployed'
+    required: false
+    default: 'false'
+  api_url:
+    description: 'chagg service base URL'
+    required: false
+    default: 'https://api.chagg.dev'
+
+runs:
+  using: "composite"
+  steps:
+    - name: Mark release as deployed
+      shell: bash
+      run: |
+        AUTO_GRANT="${{ inputs.auto_grant }}"
+        GRANT_BOOL="false"
+        if [ "$AUTO_GRANT" = "true" ]; then
+          GRANT_BOOL="true"
+        fi
+
+        HTTP_CODE=$(curl -sS -o /tmp/deploy-response.json -w '%{http_code}' \
+          -X POST \
+          -H 'Content-Type: application/json' \
+          -H "Authorization: Bearer ${{ inputs.api_key }}" \
+          -d "{\"via\": \"${{ inputs.via }}\", \"autoGrant\": ${GRANT_BOOL}}" \
+          "${{ inputs.api_url }}/releases/${{ inputs.version }}/deploy")
+
+        if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+          echo "Successfully marked v${{ inputs.version }} as deployed (via: ${{ inputs.via }})"
+        else
+          echo "::error::Failed to mark release as deployed (HTTP $HTTP_CODE)"
+          cat /tmp/deploy-response.json
+          exit 1
+        fi

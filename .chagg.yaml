@@ -1,0 +1,3 @@
+release:
+    v-prefix: never
+    alias-tags: always

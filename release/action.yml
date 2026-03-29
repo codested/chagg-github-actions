@@ -1,0 +1,180 @@
+name: 'Generate release changelog'
+description: >
+  Generates a changelog for the current release tag using chagg and exposes it
+  as action outputs, ready to feed into a GitHub release step.
+  Requires a full git history (fetch-depth: 0) in the calling workflow.
+
+inputs:
+  github_token:
+    description: 'GitHub token used to download the chagg CLI binary'
+    required: false
+    default: ${{ github.token }}
+  api_key:
+    description: >
+      chagg project API key (chagg_sk_…). When set, the release changelog
+      is uploaded to the chagg service.
+    required: false
+  api_url:
+    description: 'chagg service base URL'
+    required: false
+    default: 'https://api.chagg.dev'
+  auto_deploy:
+    description: >
+      When true and api_key is set, automatically marks the release as deployed
+      after uploading the changelog. Also auto-grants deployment if not already granted.
+    required: false
+    default: 'false'
+outputs:
+  changelog:
+    description: >
+      Changelog markdown for this release (the version section, without the
+      top-level "# Changelog" heading).
+    value: ${{ steps.generate.outputs.changelog }}
+  version:
+    description: >
+      Clean release version without any leading "v" or module tag-prefix
+      (e.g. tag "msal-browser-v1.4.0" → "1.4.0", tag "v0.7.0" → "0.7.0").
+    value: ${{ steps.parse.outputs.version }}
+  module_dir:
+    description: >
+      Repository-relative directory of the released module
+      (e.g. "lib/msal-browser" for a module whose .changes dir is
+      "lib/msal-browser/.changes"). "." for the root module.
+    value: ${{ steps.parse.outputs.module_dir }}
+
+runs:
+  using: "composite"
+  steps:
+    # ── install ──────────────────────────────────────────────────────────────
+
+    - name: Detect platform
+      id: platform
+      shell: bash
+      run: |
+        OS=$(echo "$RUNNER_OS" | tr '[:upper:]' '[:lower:]')
+
+        case "$RUNNER_ARCH" in
+          X64)   ARCH=amd64 ;;
+          ARM64) ARCH=arm64 ;;
+          *) echo "Unsupported architecture: $RUNNER_ARCH"; exit 1 ;;
+        esac
+
+        EXT=""
+        [ "$OS" = "windows" ] && EXT=".exe"
+
+        echo "os=$OS"     >> "$GITHUB_OUTPUT"
+        echo "arch=$ARCH" >> "$GITHUB_OUTPUT"
+        echo "ext=$EXT"   >> "$GITHUB_OUTPUT"
+
+    - name: Install chagg
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+      run: |
+        OS="${{ steps.platform.outputs.os }}"
+        ARCH="${{ steps.platform.outputs.arch }}"
+        EXT="${{ steps.platform.outputs.ext }}"
+
+        gh release download "0.14.2" \
+          --repo codested/chagg \
+          --pattern "chagg-${OS}-${ARCH}${EXT}" \
+          --output chagg
+        chmod +x chagg
+        echo "$PWD" >> "$GITHUB_PATH"
+
+    # ── changelog ────────────────────────────────────────────────────────────
+
+    # Generate the changelog section for the most recently tagged release.
+    # -n 1 --no-show-staging shows exactly the version that was just tagged.
+    # The first two lines ("# Changelog" + blank line) are stripped so the
+    # output starts directly with the "## vX.Y.Z" version heading.
+    - name: Generate release notes
+      id: generate
+      shell: bash
+      run: |
+        chagg generate -n 1 --show-staging false | tail -n +3 > release-notes.md
+        {
+          echo 'changelog<<CHAGG_CHANGELOG_DELIM'
+          cat release-notes.md
+          echo 'CHAGG_CHANGELOG_DELIM'
+        } >> "$GITHUB_OUTPUT"
+
+    # ── version + module dir ──────────────────────────────────────────────────
+
+    # Parse the git tag to extract:
+    #   version    – semver without any "v" or module tag-prefix
+    #   module_dir – repo-relative directory of the module ("." for root)
+    - name: Parse tag
+      id: parse
+      shell: bash
+      run: |
+        TAG="${{ github.ref_name }}"
+
+        # Collect module infos; handles repos with no .changes (returns [])
+        chagg config modules --format json > modules.json
+
+        # Find the module whose tag_prefix is a non-empty prefix of TAG,
+        # preferring the longest match (most specific module wins).
+        MATCH=$(jq -r --arg tag "$TAG" '
+          [ .modules[] | select(.tag_prefix != "" and ($tag | startswith(.tag_prefix))) ]
+          | sort_by(.tag_prefix | length) | reverse | first // empty
+        ' modules.json)
+
+        if [ -n "$MATCH" ]; then
+          TAG_PREFIX=$(echo "$MATCH" | jq -r '.tag_prefix')
+          CHANGES_DIR=$(echo "$MATCH" | jq -r '.changes_dir')
+          # Module dir is the parent of .changes (strip trailing "/.changes")
+          MODULE_DIR=$(dirname "$CHANGES_DIR")
+          [ "$MODULE_DIR" = "." ] && MODULE_DIR="."
+          # Strip module prefix, then strip optional leading "v"
+          VERSION=$(echo "$TAG" | sed "s|^${TAG_PREFIX}||" | sed 's|^v||')
+        else
+          MODULE_DIR="."
+          VERSION=$(echo "$TAG" | sed 's|^v||')
+        fi
+
+        echo "version=$VERSION"       >> "$GITHUB_OUTPUT"
+        echo "module_dir=$MODULE_DIR" >> "$GITHUB_OUTPUT"
+
+    # ── Upload release changelog to chagg service ────────────────────────────
+
+    - name: Upload release changelog
+      if: inputs.api_key != ''
+      shell: bash
+      run: |
+        chagg generate -n 1 --format json > release.json
+
+        curl -fsSL -X POST \
+          -H 'Content-Type: application/json' \
+          -H "Authorization: Bearer ${{ inputs.api_key }}" \
+          --data @release.json \
+          "${{ inputs.api_url }}/changelogs"
+
+    - name: Upload resources
+      if: inputs.api_key != ''
+      shell: bash
+      run: |
+        "${{ github.action_path }}/../scripts/upload-resources.sh" \
+          release.json \
+          "${{ inputs.api_key }}" \
+          "${{ inputs.api_url }}"
+
+    - name: Mark release as deployed
+      if: inputs.api_key != '' && inputs.auto_deploy == 'true'
+      shell: bash
+      run: |
+        VERSION="${{ steps.parse.outputs.version }}"
+
+        HTTP_CODE=$(curl -sS -o /tmp/deploy-response.json -w '%{http_code}' \
+          -X POST \
+          -H 'Content-Type: application/json' \
+          -H "Authorization: Bearer ${{ inputs.api_key }}" \
+          -d '{"via": "github-action", "autoGrant": true}' \
+          "${{ inputs.api_url }}/releases/${VERSION}/deploy")
+
+        if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+          echo "Marked v${VERSION} as deployed"
+        else
+          echo "::warning::Failed to mark release as deployed (HTTP $HTTP_CODE)"
+          cat /tmp/deploy-response.json
+        fi
